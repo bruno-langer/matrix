@@ -1,6 +1,7 @@
 #include <FastLED.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <secrets.h>
 
 #define DATA_PIN 26
 #define NUM_LEDS 144
@@ -19,8 +20,8 @@ const int pinoDT = 4;   // PINO DIGITAL (DT)
 const int pinoSW = 5;   // PINO DIGITAL (SW)
 
 // WiFi configuration
-const char* ssid = "SEU_SSID";
-const char* password = "SUA_SENHA";
+const char* ssid = SECRET_SSID;
+const char* password = SECRET_PASS;
 
 WebServer server(80);
 
