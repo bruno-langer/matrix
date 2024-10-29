@@ -1,10 +1,10 @@
 #include <FastLED.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <secrets.h>
+#include "secrets.h"
 
 #define DATA_PIN 26
-#define NUM_LEDS 144
+#define NUM_LEDS 5
 
 #define MODE_OFF 0
 #define MODE_COLOR 1
@@ -15,9 +15,9 @@
 #define SWITCH_PIN1 34  // Pino digital 1 da chave
 #define SWITCH_PIN2 35  // Pino digital 2 da chave
 
-const int pinoCLK = 3;  // PINO DIGITAL (CLK)
-const int pinoDT = 4;   // PINO DIGITAL (DT)
-const int pinoSW = 5;   // PINO DIGITAL (SW)
+// Pinos do encoder
+#define ENCODER_CLK 4
+#define ENCODER_DT 5
 
 // WiFi configuration
 const char* ssid = SECRET_SSID;
@@ -28,14 +28,13 @@ WebServer server(80);
 CRGB leds[NUM_LEDS];
 int mode = MODE_OFF;
 
-int encoderCount = 0;
-int ultPosicao;
-int leituraCLK;
-bool dir;
-
+volatile int encoderCount = 0;
+int lastEncoderCount = 0;       // Guarda o último valor do encoder
 int hue = 0;                    // Variável para armazenar o valor de HUE no modo COLOR
 int lightTemperatureIndex = 4;  // Começa com um valor médio no array de temperatura
 
+unsigned long lastInterruptTime = 0;     // Para debounce
+const unsigned long debounceDelay = 20;  // Delay em milissegundos para debounce
 
 // Array de temperaturas de cor
 const CRGB temperatureColors[] = {
@@ -43,41 +42,69 @@ const CRGB temperatureColors[] = {
   CarbonArc, HighNoonSun, DirectSunlight, OvercastSky, ClearBlueSky
 };
 
+// Variável para controlar a direção do encoder
+bool dir;
+
+void IRAM_ATTR encoderISR() {
+  unsigned long currentTime = millis();
+
+  // Verifica se o tempo atual é maior que o último tempo de interrupção + o delay de debounce
+  if (currentTime - lastInterruptTime > debounceDelay) {
+    // Atualiza o último tempo de interrupção
+    lastInterruptTime = currentTime;
+
+    // Direção do encoder
+    int dtState = digitalRead(ENCODER_DT);
+    if (dtState != digitalRead(ENCODER_CLK)) {
+      encoderCount++;
+      dir = true;
+    } else {
+      encoderCount--;
+      dir = false;  // Sentido anti-horário
+    }
+  }
+}
+
 void setup() {
   Serial.begin(115200);
-  FastLED.addLeds<WS2812B, DATA_PIN>(leds, NUM_LEDS);
 
-  // Conectar ao Wi-Fi
-  connectToWiFi();
+  // Configuração dos pinos do encoder
+  pinMode(ENCODER_CLK, INPUT);
+  pinMode(ENCODER_DT, INPUT);
 
-  // Configurar os pinos da chave de 3 posições e encoder
+  // Configuração dos pinos da chave de 3 posições
   pinMode(SWITCH_PIN1, INPUT);
   pinMode(SWITCH_PIN2, INPUT);
-  pinMode(pinoCLK, INPUT);
-  pinMode(pinoDT, INPUT);
-  pinMode(pinoSW, INPUT_PULLUP);
 
-  // Inicializar a leitura do encoder
-  ultPosicao = digitalRead(pinoCLK);
+  // Configura interrupções para o pino CLK
+  attachInterrupt(digitalPinToInterrupt(ENCODER_CLK), encoderISR, CHANGE);
+
+  FastLED.addLeds<WS2812B, DATA_PIN,GRB>(leds, NUM_LEDS);
+  FastLED.setBrightness(128);
+
+  // Conectar ao Wi-Fi
+   connectToWiFi();
+   setupServer();
 }
 
 void loop() {
-  // Verificar o modo de operação com base nos switches
+  // Verifica modo de operação com base nos switches
   readSwitchMode();
 
-  // Verificar o botão do encoder para alternar modos
-  if (buttonRead()) {
-    mode = (mode + 1) % 3;  // Alterna entre os 3 modos
+  // Ajusta cor ou temperatura de luz dependendo do modo e direção do encoder
+  if (encoderCount != lastEncoderCount) {
+    adjustColor(dir ? 1 : -1);  // Incrementa ou decrementa conforme a direção
+    lastEncoderCount = encoderCount;
   }
 
-  // Ler a posição do encoder e ajustar cor ou temperatura
-  encoderRead();
-
-  // Executar ação conforme o modo
+  // Executa a ação conforme o modo
   handleModes();
 
   // Processar requisições HTTP
   server.handleClient();
+
+  delay(100);
+  debugPrint();
 }
 
 // Função para conectar ao Wi-Fi
@@ -109,36 +136,6 @@ void setupServer() {
     }
   });
 
-   server.on("/setColors", HTTP_POST, []() {
-    if (server.hasArg("plain")) {
-      String colorString = server.arg("plain");  // Lê a carga útil
-      int ledCount = 0;
-
-      // Divide a string em cores individuais usando a vírgula como delimitador
-      int startIndex = 0;
-      int commaIndex;
-      while ((commaIndex = colorString.indexOf(',', startIndex)) != -1 && ledCount < NUM_LEDS) {
-        String hexColor = colorString.substring(startIndex, commaIndex);
-        setLedColor(ledCount, hexColor);
-        ledCount++;
-        startIndex = commaIndex + 1;  // Atualiza o índice de início para a próxima cor
-      }
-
-      // Para o último LED (caso não tenha vírgula no final)
-      if (startIndex < colorString.length() && ledCount < NUM_LEDS) {
-        String hexColor = colorString.substring(startIndex);
-        setLedColor(ledCount, hexColor);
-      }
-
-      FastLED.show();  // Atualiza os LEDs
-      server.send(200, "text/plain", "Cores definidas com sucesso.");
-    } else {
-      server.send(400, "text/plain", "Nenhuma carga útil fornecida.");
-    }
-  });
-
-
-
   // Rota para ajustar a temperatura da luz
   server.on("/light", HTTP_GET, []() {
     if (server.hasArg("temp")) {
@@ -148,6 +145,8 @@ void setupServer() {
       server.send(400, "text/plain", "Parâmetro 'temp' não fornecido.");
     }
   });
+
+  server.begin();
 }
 
 // Função para ler o estado dos switches e definir o modo
@@ -164,67 +163,59 @@ void readSwitchMode() {
   }
 }
 
-void setLedColor(int ledIndex, String hexColor) {
-  if (hexColor.length() == 7 && hexColor[0] == '#') {                                   // Verifica se o formato é válido
-    long number = strtol(&hexColor[1], NULL, 16);                                       // Converte a string HEX para um número
-    leds[ledIndex] = CRGB((number >> 16) & 0xFF, (number >> 8) & 0xFF, number & 0xFF);  // Define a cor do LED
-  }
-}
+void debugPrint() {
+  Serial.print("Modo: ");
+  Serial.print(mode);
 
+  Serial.print(" | HUE ");
+  Serial.print(hue);
+  Serial.print(" | TEMP INDEX ");
+  Serial.print(lightTemperatureIndex);
+
+  Serial.print(" | Encoder Count: ");
+  Serial.print(encoderCount);
+
+  Serial.print(" | Direção Encoder: ");
+  Serial.print(dir ? "Horario" : "Anti-horario");
+
+  Serial.print(" | Wi-Fi: ");
+  Serial.print(WiFi.status() == WL_CONNECTED ? "Conectado" : "Desconectado");
+
+  Serial.print(" | IP: ");
+  Serial.print(WiFi.localIP());
+
+
+  Serial.println();
+}
 
 // Função para gerenciar modos de operação
 void handleModes() {
   switch (mode) {
     case MODE_OFF:
       FastLED.showColor(CRGB::Black);
-      delay(100);
       break;
 
     case MODE_COLOR:
-      FastLED.showColor(CHSV(hue, 255, 255));  // Controla o HUE, com saturação e brilho fixos
-      delay(100);
+      FastLED.showColor(CHSV(hue, 255, 255));
       break;
 
     case MODE_LIGHT:
       fill_solid(leds, NUM_LEDS, temperatureColors[lightTemperatureIndex]);
       FastLED.show();
-      delay(100);
       break;
   }
 }
 
-// Função para ler o botão do encoder com debounce
-bool buttonRead() {
-  static unsigned long lastPress = 0;
-  if (digitalRead(pinoSW) == LOW) {
-    if (millis() - lastPress > 200) {  // Debounce
-      lastPress = millis();
-      return true;
-    }
-  }
-  return false;
-}
-
-// Função para ler o encoder rotativo
-void encoderRead() {
-  leituraCLK = digitalRead(pinoCLK);
-  if (leituraCLK != ultPosicao && leituraCLK == LOW) {
-    if (digitalRead(pinoDT) != leituraCLK) {
-      adjustColor(1);  // Girou no sentido horário
-    } else {
-      adjustColor(-1);  // Girou no sentido anti-horário
-    }
-  }
-  ultPosicao = leituraCLK;
-}
-
-// Função para ajustar cor ou temperatura com base no modo
+// Função para ajustar cor ou temperatura com base no modo e direção do encoder
 void adjustColor(int direction) {
   if (mode == MODE_COLOR) {
-    hue = (hue + direction * 5) % 256;  // Ajusta o valor de HUE, variando entre 0 e 255
+    hue = (hue + (direction * 10)) % 256;
+    if (hue < 0) {
+      hue += 256;
+    }
     FastLED.showColor(CHSV(hue, 255, 255));
   } else if (mode == MODE_LIGHT) {
-    lightTemperatureIndex = constrain(lightTemperatureIndex + direction, 0, 8);  // Ajusta o índice de temperatura
+    lightTemperatureIndex = constrain(lightTemperatureIndex + direction, 0, 8);
     fill_solid(leds, NUM_LEDS, temperatureColors[lightTemperatureIndex]);
     FastLED.show();
   }
